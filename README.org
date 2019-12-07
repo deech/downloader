@@ -1,0 +1,4 @@
+* downloader
+  A small, low-dependency library that provides turn-key file download over HTTP and HTTPS. 
+
+  See the [[http://hackage.haskell.org/package/downloader/docs/Network-HTTP-Download-File.html][Haddock documentation]] for more detail and [[https://github.com/deech/cabal-downloader-demo][cabal-downloader-demo]] for a small demo which shows how to use it at build time to download assets.
