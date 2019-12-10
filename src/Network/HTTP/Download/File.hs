@@ -4,12 +4,13 @@ module Network.HTTP.Download.File
     -- $Introduction
     downloadFile
   , Overwrite(..)
+  , ProxyAuth(..)
   )
 
 where
 import System.Process
 import System.Exit
-import Network.URI(parseURI, URI(..))
+import Network.URI
 import Control.Exception
 import System.Info(os,arch)
 import System.Directory
@@ -17,11 +18,27 @@ import System.FilePath
 import Paths_downloader(getDataDir, version)
 import Data.Version(showVersion)
 import GHC.Stack
+import Safe
 
 -- | A 'Bool' wrapper that is passed to 'downloadFile' and
 -- which if set to @(Overwrite True)@ will allow 'downloadFile' to
 -- overwrite an existing file.
 newtype Overwrite = Overwrite { _overwrite :: Bool }
+
+-- | Used for proxy authentication:
+-- @Basic ("user", "pass")@ indicates that the proxy needs
+-- <https://en.wikipedia.org/wiki/Basic_access_authentication basic authentication>
+-- and where the username is "user" and the password is "pass".
+-- whereas with @Digest ("user", "pass")@
+-- <https://en.wikipedia.org/wiki/Digest_access_authentication digest authentication>
+-- is used instead.
+--
+-- In a nutshell with Basic Auth your password is sent over the network in clear
+-- text so anyone monitoring traffic can see it. With digest auth each request
+-- generates two calls, the first gets the proxy's unique hash key and the second
+-- sends the actual request with the password hashed using the unique key so
+-- anyone monitoring web traffic only sees it encrypted.
+data ProxyAuth = Basic (String, String) | Digest (String, String) deriving Show
 
 {-|
   Downloads a file from the given URL via a GET request to the specified
@@ -48,6 +65,7 @@ newtype Overwrite = Overwrite { _overwrite :: Bool }
 
   - A badly formed URL
   - A URL that specifies a protocol that is not http or https, eg. "ftp" will be rejected
+  - A badly formed proxy URL.
   - A non existent directory or one that isn't writeable
   - An <https://hackage.haskell.org/package/filepath/docs/System-FilePath-Posix.html#v:isValid invalid> output filename
   - A filename that includes parent directories eg, "a\/b\/c\/file.txt"
@@ -57,25 +75,30 @@ newtype Overwrite = Overwrite { _overwrite :: Bool }
 
 downloadFile :: HasCallStack
   => String    -- ^ URL from which to download a file (or web page)
+  -> Maybe (String, Maybe ProxyAuth) -- ^ Proxy authentication, eg. @Just ("http://192.168.0.10:3128", Just (Digest ("user", "pass")))@
   -> FilePath  -- ^ Directory in which to save the file (it must exist)
   -> FilePath  -- ^ File name into which to save the downloaded data
   -> Overwrite -- ^ Optionally overwrite the file if it already exists
   -> IO FilePath
-downloadFile urlString directory outputFilename overwrite = do
+downloadFile urlString proxyInfo directory outputFilename overwrite = do
   u <- getUrl
   o <- getOutputPath
+  proxyM <-
+    case proxyInfo of
+      Just pi -> Just <$> getProxyUrl pi
+      Nothing -> pure Nothing
   -- drop the '?' from the query params.
   -- Both the curl command and Powershell script
   -- add it back in before making the web request.
   let (urlOnly, queryParams) = (u { uriQuery = ""}, drop 1 (uriQuery u))
   if (os == "mingw32")
     then do
-    res <- lines <$> runPowershellDownload urlOnly queryParams o
+    res <- lines <$> runPowershellDownload urlOnly proxyM queryParams o
     case res of
       (['2','0','0']:_) -> pure o
       _ -> throwIO (userError (unlines res))
     else do
-    res <- runCurlDownload urlOnly queryParams o
+    res <- runCurlDownload urlOnly proxyM queryParams o
     case res of
       Left err -> throwIO (userError err)
       Right Nothing -> throwIO (userError $ "No output from download process, expected an HTTP return code")
@@ -92,6 +115,11 @@ downloadFile urlString directory outputFilename overwrite = do
     shScript = inDataDir "download.sh"
     powershellScript :: IO String
     powershellScript = inDataDir "download.ps1"
+    getProxyUrl :: (String, Maybe ProxyAuth) -> IO (URI, Maybe ProxyAuth)
+    getProxyUrl (urlString, auth) =
+      case parseURI urlString of
+        Nothing -> throwIO (userError $ "Failed to parse the proxy URL: " ++ urlString)
+        Just url -> pure (url, auth)
     getUrl :: IO URI
     getUrl =
       -- break out query params because spaces don't parse.
@@ -132,23 +160,31 @@ downloadFile urlString directory outputFilename overwrite = do
         if (opExists && not (_overwrite overwrite))
           then throwIO (userError $ "The output file already exists: " ++ outputPath)
           else pure outputPath
-    runCurlDownload ::  URI -> String -> FilePath -> IO (Either String (Maybe Int))
-    runCurlDownload url queryParams outputPath = do
+    runCurlDownload ::  URI -> Maybe (URI, Maybe ProxyAuth) -> String -> FilePath -> IO (Either String (Maybe Int))
+    runCurlDownload url proxyInfo queryParams outputPath = do
       downloadSh <- shScript
-      (exitCode,stdout,stderr) <- readProcessWithExitCode "sh" [downloadSh, show url, show queryParams, outputPath, show userAgent] ""
+      let args =
+            [downloadSh, show url, show queryParams, outputPath, show userAgent] ++
+            (case proxyInfo of
+               Nothing -> []
+               Just (proxyUrl, Nothing) -> [show proxyUrl]
+               Just (proxyUrl, Just (Basic (user,pass))) -> [show proxyUrl, user ++ ":" ++ pass, "basic"]
+               Just (proxyUrl, Just (Digest (user,pass))) -> [show proxyUrl, user ++ ":" ++ pass, "digest"])
+      (exitCode,stdout,stderr) <- readProcessWithExitCode "sh" args ""
       case exitCode of
         ExitSuccess -> do
-          pure $ Right $
-            if (not (null stdout))
-            then Just (read stdout)
-            else Nothing
+          if (not (null stdout))
+          then case readMay stdout of
+            Nothing -> throwIO (userError $ "Expecting a number, got: " ++ stdout)
+            Just res -> pure (Right (Just res))
+          else pure (Right Nothing)
         ExitFailure errCode -> do
           pure $ Left $ show errCode ++
             (if (not (null stderr))
              then ":" ++ stderr
              else "")
-    runPowershellDownload :: URI -> String -> FilePath -> IO String
-    runPowershellDownload url queryParams outputPath = do
+    runPowershellDownload :: URI -> Maybe (URI, Maybe ProxyAuth) -> String -> FilePath -> IO String
+    runPowershellDownload url proxyInfo queryParams outputPath = do
       downloadWin <- powershellScript
       let args =
             [ "-ExecutionPolicy", "bypass"
@@ -161,7 +197,12 @@ downloadFile urlString directory outputFilename overwrite = do
             ] ++
             (if (not (null queryParams))
             then [ "-queryParams" , queryParams ]
-            else [])
+            else []) ++
+            (case proxyInfo of
+               Nothing -> []
+               Just (proxyUrl, Nothing) -> ["-proxy", show proxyUrl]
+               Just (proxyUrl, Just (Basic (user,pass))) -> [ "-proxy", show proxyUrl, "-user", user, "-pass", pass, "-auth", "basic" ]
+               Just (proxyUrl, Just (Digest (user,pass))) -> [ "-proxy", show proxyUrl, "-user", user, "-pass", pass, "-auth", "digest" ])
       (_,stdout,_) <- readProcessWithExitCode "powershell.exe" args ""
       pure stdout
 

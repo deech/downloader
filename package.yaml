@@ -14,7 +14,7 @@ description:         Please see the Hackage documentation at <http://hackage.has
 
 dependencies:
 - base >= 4.7 && < 5
-
+- safe >= 0.3.16 && < 0.4
 data-files:
   - scripts/download.sh
   - scripts/download.ps1
